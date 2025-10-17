@@ -35,7 +35,7 @@ from astral.sun import azimuth, elevation
 # Public API
 # -----------------------------
 
-def normalize(
+def scene_card(
     lat: float,
     lon: float,
     dt_utc: datetime,
@@ -61,7 +61,7 @@ def normalize(
     tzname = tz_for_point(lat, lon)
     dt_local = to_local(dt_utc, tzname)
     cal = derive_calendar(dt_local, lat, lon)
-
+    loc = reverse_geocode(lat, lon)
     sun = sun_position_flags(lat, lon, dt_local)
 
     if climate is None:
@@ -84,46 +84,195 @@ def normalize(
             "weekday": cal["weekday"],
             "doy": cal["doy"],
             "is_holiday": cal["is_holiday"],
+            "holiday_name": cal["holiday_name"],
         },
         "sun": sun,
         "weather": weather,
         "climate": {"koppen": koppen, "leaf_on": bool(leaf_on)},
         "camera": {"heading_deg": heading_deg, "hfov_deg": 70},
+        "location": loc,
     }
     return norm
 
+def _sun_buckets(azimuth_deg: float | None, elevation_deg: float | None):
+    """Coarse buckets for better promptability."""
+    def dir_bucket(a):
+        if a is None: return "unknown"
+        a = a % 360
+        dirs = ["N","NE","E","SE","S","SW","W","NW"]
+        idx = int(((a + 22.5) % 360) // 45)
+        return dirs[idx]
+    def elev_bucket(e):
+        if e is None: return "unknown"
+        return "high" if e >= 35 else ("medium" if e >= 12 else ("low" if e >= 0 else "below horizon"))
+    return dir_bucket(azimuth_deg), elev_bucket(elevation_deg)
 
-def scene_card(norm: Dict[str, Any]) -> str:
-    """Deterministic, CLIP-friendly scene description from normalized struct."""
-    landuse = norm["geo"].get("landuse_counts", {})
-    landuse_top = ", ".join(sorted(landuse, key=landuse.get, reverse=True)[:3]) or "unknown"
-    sun = norm["sun"]
-    wx = norm["weather"]
-    t = norm["time"]
-    c = norm["climate"]
+def scene_card_to_template_prompt(card: dict, *, full: bool = False) -> str:
+    """
+    Deterministic template prompt for a VLM.
+    """
+    geo  = norm.get("geo", {}) or {}
+    t    = norm.get("time", {}) or {}
+    sun  = norm.get("sun", {}) or {}
+    wx   = norm.get("weather", {}) or {}
+    clim = norm.get("climate", {}) or {}
+    cam  = norm.get("camera", {}) or {}
+    loc  = norm.get("location", {}) or {}
 
-    phase = (
-        "golden" if sun.get("is_golden_hour")
-        else ("blue" if sun.get("is_blue_hour") else ("day" if sun.get("is_day") else "night"))
-    )
+    # location
+    lat, lon = geo.get("lat"), geo.get("lon")
+    place_map = {
+        "urban_residential": "residential neighborhood",
+        "urban_commercial":  "commercial district",
+        "parkland":          "parkland area",
+        "rural_farmland":    "farmland",
+        "industrial":        "industrial area",
+        "mixed_urban":       "mixed urban area",
+    }
+    pt = (geo.get("place_type") or "").lower()
+    place_phrase = place_map.get(pt, "streetscape")
+    
+    city = loc.get("city")
+    cc   = (loc.get("country_code") or "").upper() or None
+    lat, lon = geo.get("lat"), geo.get("lon")
+    poi  = geo.get("nearest_poi")
+    # --- lead line: place + admin + coords + (useful) POI ---
+    lead_bits = [place_phrase]
+    if city and cc:
+        lead_bits.append(f"in {city}, {cc}")
+    elif city:
+        lead_bits.append(f"in {city}")
+    elif cc:
+        lead_bits.append(f"in {cc}")
 
-    nearest_poi = norm["geo"].get("nearest_poi") or "no notable POI"
+    if poi:
+        low = str(poi).strip().lower()
+        if low not in {"no notable poi", "unknown", ""} and not any(b in low for b in ("bus stop","parking","intersection","roundabout","residential area")):
+            lead_bits.append(f"near {poi}")
 
-    return (
-        f'{norm["geo"]["place_type"]} streetscape near {nearest_poi}.\n'
-        f'Layout: {landuse_top}. '
-        f'Time: {t["dt_local"][11:16]}, sun {sun["azimuth_deg"]:.0f}°/{sun["elevation_deg"]:.0f}° ({phase}). '
-        f'Weather: {wx.get("label", "unknown")}, '
-        f'{wx.get("temp_c", 0):.0f}°C, wind {wx.get("wind_mps", 0):.0f} m/s, '
-        f'visibility {wx.get("visibility_km", 0):.0f} km. '
-        f'Season: {"leaf-on" if c.get("leaf_on") else "leaf-off"} ({c.get("koppen", "?")}).'
-    )
+    lead = ", ".join(lead_bits) + "."
+    # --- time line: ISO local, holiday/weekday, light, sun buckets + degrees ---
+    dt_local = t.get("dt_local")
+    weekday  = t.get("weekday")
+    holiday  = t.get("holiday_name") or ("public holiday" if t.get("is_holiday") else None)
 
+    # pretty time: "2025-12-25 18:00 (UTC+01:00)"
+    time_txt = None
+    if dt_local:
+        # dt_local looks like "YYYY-MM-DDTHH:MM:SS+01:00"
+        # render "YYYY-MM-DD HH:MM (UTC+01:00)"
+        date_time, tz_off = dt_local.split("+") if "+" in dt_local else (dt_local, "")
+        date_time = date_time.replace("T", " ")
+        if tz_off:
+            time_txt = f"{date_time} (UTC+{tz_off})"
+        else:
+            # handle negative offsets too
+            if "-" in dt_local[19:]:
+                date_time, tz_off = dt_local[:19].replace("T", " "), dt_local[19:]
+                time_txt = f"{date_time} (UTC{tz_off})"
+            else:
+                time_txt = date_time
 
+    phase = ("golden" if sun.get("is_golden_hour") else
+             "blue"   if sun.get("is_blue_hour")  else
+             "day"    if sun.get("is_day")        else "night")
+    az, el = sun.get("azimuth_deg"), sun.get("elevation_deg")
+
+    # small inline buckets for readability
+    sun_txt = None
+    if az is not None and el is not None:
+        dirs = ["N","NE","E","SE","S","SW","W","NW"]
+        dir_bucket = dirs[int((((az + 22.5) % 360)//45))]
+        elev_bucket = "high" if el >= 35 else "medium" if el >= 12 else "low" if el >= 0 else "below horizon"
+        sun_txt = f"{phase} (sun {dir_bucket}, {elev_bucket}; {az:.0f}°/{el:.0f}°)"
+    else:
+        sun_txt = phase
+
+    cal_bits = []
+    if holiday: cal_bits.append(holiday)
+    if weekday: cal_bits.append(f"weekday {weekday}")
+    cal_txt = ", ".join(cal_bits) if cal_bits else None
+
+    time_line_bits = []
+    if time_txt: time_line_bits.append(f"Local time: {time_txt}")
+    if cal_txt:   time_line_bits.append(cal_txt)
+    if sun_txt:   time_line_bits.append(sun_txt)
+    time_line = " — ".join(time_line_bits) + "." if time_line_bits else ""
+
+    # --- layout from landuse top-k ---
+    landuse_counts = geo.get("landuse_counts") or {}
+    landuse_top = ", ".join(sorted(landuse_counts, key=landuse_counts.get, reverse=True)[:3])
+    layout_line = f"Layout: {landuse_top}." if landuse_top else ""
+
+    # --- weather (legacy keys supported) ---
+    condition = wx.get("condition") or wx.get("label")
+    temp_c    = wx.get("temperature_c", wx.get("temp_c"))
+    wind_mps  = wx.get("wind_mps")
+    precip_mm = wx.get("precip_mm")
+    vis_km    = wx.get("visibility_km")
+
+    wx_bits = []
+    if condition: wx_bits.append(condition)
+    if full and (temp_c is not None):   wx_bits.append(f"{temp_c:.0f}°C")
+    if full and (wind_mps is not None): wx_bits.append(f"wind {wind_mps:.0f} m/s")
+    if full and (precip_mm is not None):wx_bits.append(f"precip {precip_mm:.1f} mm")
+    if full and (vis_km is not None):   wx_bits.append(f"visibility {vis_km:.0f} km")
+    weather_line = ("Weather: " + ", ".join(wx_bits) + ".") if wx_bits else ""
+
+    # --- climate & camera (full mode) ---
+    climate_line = ""
+    if full and isinstance(clim, dict):
+        cparts = []
+        if clim.get("koppen"):  cparts.append(clim["koppen"])
+        if "leaf_on" in clim:   cparts.append("leaf-on" if clim["leaf_on"] else "leaf-off")
+        if cparts:
+            climate_line = "Climate: " + ", ".join(cparts) + "."
+
+    camera_line = ""
+    if full:
+        cparts = []
+        if cam.get("heading_deg") is not None: cparts.append(f"heading {cam['heading_deg']:.0f}°")
+        if cam.get("hfov_deg")    is not None: cparts.append(f"hfov {cam['hfov_deg']:.0f}°")
+        if cparts:
+            camera_line = "Camera: " + ", ".join(cparts) + "."
+
+    # --- stable style tag ---
+    style = "Photorealistic street-level photo, 35mm lens, natural colors."
+
+    if not full:
+        # Compact: lead + time/sun + minimal weather + style
+        compact_parts = [lead, time_line]
+        if condition:
+            compact_parts.append(f"Weather: {condition}.")
+        compact_parts.append(style)
+        return " ".join(p for p in compact_parts if p).strip()
+    else:
+        parts = [lead, time_line, layout_line, weather_line, climate_line, camera_line, style]
+        return " ".join(p for p in parts if p).strip()
 # -----------------------------
 # Helpers (with real implementations)
 # -----------------------------
-
+def reverse_geocode(lat: float, lon: float) -> dict:
+    """
+    Best-effort reverse geocode. Returns empty strings if provider not available.
+    Uses OpenStreetMap Nominatim via geopy. Safe to keep as optional.
+    """
+    try:
+        from geopy.geocoders import Nominatim
+        geolocator = Nominatim(user_agent="gps_future_norm/1.0", timeout=5)
+        loc = geolocator.reverse((lat, lon), language="en", zoom=16)
+        addr = loc.raw.get("address", {}) if loc and hasattr(loc, "raw") else {}
+        return {
+            "country_code": (addr.get("country_code") or "").upper(),
+            "region": addr.get("state") or "",
+            "city": addr.get("city") or addr.get("town") or addr.get("village") or addr.get("municipality") or "",
+            "neighborhood": addr.get("neighbourhood") or addr.get("suburb") or addr.get("quarter") or "",
+            "display_name": loc.address if loc else "",
+        }
+    except Exception:
+        # Fallback: empty labels; prompts will simply omit these
+        return {"country_code": "", "region": "", "city": "", "neighborhood": "", "display_name": ""}
+    
 def osm_features(lat: float, lon: float, r: int = 150) -> Tuple[str, Optional[str], Dict[str, int]]:
     """Query OSM around point to get a coarse "place_type", nearest POI name, and land-use counts.
 
@@ -264,11 +413,15 @@ def derive_calendar(dt_local: datetime, lat: float, lon: float) -> Dict[str, Any
     country = "FR" if -10 <= lon <= 30 and 35 <= lat <= 60 else "US"
     try:
         import holidays
-        is_holiday = dt_local.date() in holidays.country_holidays(country)
+        h = holidays.country_holidays(country)
+        name = h.get(dt_local.date())
+        is_holiday = False
+        if name:
+            is_holiday = True
     except Exception:
         is_holiday = False
 
-    return {"weekday": weekday, "doy": doy, "is_holiday": bool(is_holiday)}
+    return {"weekday": weekday, "doy": doy, "is_holiday": bool(is_holiday), "holiday_name": name}
 
 def sun_position_flags(lat: float, lon: float, dt_local: datetime) -> Dict[str, Any]:
     """
@@ -333,9 +486,9 @@ def lookup_koppen_leafstate(lat: float, lon: float, doy: int) -> Tuple[str, bool
 if __name__ == "__main__":
     # Example: Eiffel Tower, Nov 26, 2025 17:00 UTC
     import json
-    dt = datetime(2025, 12, 25, 17, 0, 0)  # UTC
+    dt = datetime(2025, 12, 24, 17, 0, 0)  # UTC
     weather = {"label": "overcast", "temp_c": 7.4, "wind_mps": 3.1, "precip_mm": 0.0, "visibility_km": 8.0}
 
-    norm = normalize(48.85837, 2.29448, dt, weather)
+    norm = scene_card(48.85837, 2.29448, dt, weather)
     print(json.dumps(norm, indent=2))
-    print("\nSCENE CARD:\n", scene_card(norm))
+    print("\nSCENE CARD TO TEMPLATE PROMPT:\n", scene_card_to_template_prompt(norm))
